@@ -1,302 +1,333 @@
+# ==============================================================================
+# GPU ACCELERATION PROTOCOL (NVIDIA/CUDA)
+#
+# This script is configured to use the fastest possible execution path:
+# 1. Python Multiprocessing (true parallel processing across CPU cores).
+# 2. OpenCV DNN CUDA Backend (GPU acceleration).
+#
+# If the script runs slowly or throws an error (e.g., "Requested backend/target is not supported"),
+# it means the GPU environment is not properly configured. Follow these steps:
+#
+# ------------------------------------------------------------------------------
+# STEP 1: Confirm NVIDIA Drivers and Hardware
+# ------------------------------------------------------------------------------
+# - Ensure you have a CUDA-compatible NVIDIA GPU.
+# - Install the latest stable NVIDIA Graphics Drivers from the official website.
+#
+# ------------------------------------------------------------------------------
+# STEP 2: Install the CUDA Toolkit
+# ------------------------------------------------------------------------------
+# - CRITICAL: Download and install a version of the CUDA Toolkit that is
+#   compatible with the OpenCV version you are using. Version matching is key.
+#   Start by checking common versions like CUDA 11.8 or 12.1.
+# - Download from the NVIDIA CUDA Toolkit Archive.
+#
+# ------------------------------------------------------------------------------
+# STEP 3: Install cuDNN (Deep Neural Network Library)
+# ------------------------------------------------------------------------------
+# - Download the cuDNN library version that matches your installed CUDA Toolkit.
+# - This is a manual installation: Unzip the cuDNN archive and copy the files
+#   (from the 'bin', 'include', and 'lib' folders) into the corresponding
+#   subdirectories of your CUDA Toolkit installation path.
+#
+# ------------------------------------------------------------------------------
+# STEP 4: Code Activation (Already Implemented Below)
+# ------------------------------------------------------------------------------
+# - The lines below explicitly tell OpenCV to use the CUDA backend and target:
+#   sr.setPreferableBackend(cv2.dnn.DNN_BACKEND_CUDA)
+#   sr.setPreferableTarget(cv2.dnn.DNN_TARGET_CUDA)
+# ------------------------------------------------------------------------------
+#
+# If the GPU setup fails, temporarily comment out the two CUDA lines above and
+# uncomment the two CPU lines, or switch to the much faster ESPCN model.
+# ==============================================================================
+
 import cv2
-import tkinter as tk
-from tkinter import filedialog, ttk, messagebox
 import os
-import multiprocessing
+import tkinter as tk
+from tkinter import filedialog, ttk, scrolledtext
+from multiprocessing import Pool, Queue
 import time
-import math
-from functools import partial
+import queue as q_temp # Using a different alias for the standard queue
+import threading
 
-# --- GLOBAL APPLICATION VARIABLES ---
-# These are managed in the main process
-model_path = ""
-input_folder = ""
-output_folder = ""
-is_processing = False
-total_files = 0
-processed_count = 0
-manager = None
-status_queue = None
-pool = None
-root = None
+# --- GLOBAL SETTINGS ---
+# Use all cores minus one to keep the system responsive
+CPU_CORES = os.cpu_count() - 1 if os.cpu_count() > 1 else 1
 
-def process_frame_worker(file_name, input_dir, output_dir, model_path_str, status_q):
-    """
-    Worker function executed by a separate process.
-    It loads the model, processes a single frame, and reports status via a Queue.
-    
-    CRITICAL: Configured to use CUDA/GPU. If the environment is not set up 
-    with CUDA Toolkit and cuDNN, this will throw an error and revert to 
-    the previous CPU configuration is recommended.
-    """
-    try:
-        # 1. Read the image
-        input_path = os.path.join(input_dir, file_name)
-        output_path = os.path.join(output_dir, f"enhanced_{file_name}")
-        
-        frame = cv2.imread(input_path)
-        if frame is None:
-            status_q.put({"type": "error", "file": file_name, "message": "Could not read image file."})
-            return 1 # Return 1 for failure, 0 for success
+class BatchImageClarityEnhancer:
+    def __init__(self, master):
+        self.master = master
+        master.title("Batch Image Clarity Enhancer (GPU/Multiprocessing)")
+        master.geometry("800x600")
+        master.configure(bg="#2c3e50")
 
-        # 2. Initialize and Load Model (Must be done per process as sr object may not be pickleable)
-        sr = cv2.dnn_superres.DnnSuperResImpl_create()
-        
-        # Determine model name and scale from the filename (e.g., 'LapSRN_x8.pb')
-        model_name = os.path.basename(model_path_str).split('_')[0].lower()
-        scale = int(os.path.basename(model_path_str).split('x')[-1].split('.')[0])
-        
-        sr.readModel(model_path_str)
-        sr.setModel(model_name, scale)
+        self.input_dir = tk.StringVar()
+        self.output_dir = tk.StringVar()
+        self.model_path = tk.StringVar()
+        self.status_var = tk.StringVar(value="Ready. Select directories and model.")
 
-        # --- FINAL GPU CONFIGURATION ---
-        # Explicitly setting to CUDA backend for high-speed GPU processing
-        sr.setPreferableBackend(cv2.dnn.DNN_BACKEND_CUDA)
-        sr.setPreferableTarget(cv2.dnn.DNN_TARGET_CUDA)
+        self.is_running = False
+        self.job_queue = []
+        self.total_frames = 0
+        self.processed_count = 0
+        self.stop_event = threading.Event()
 
-        # 3. Perform Super Resolution
-        result = sr.upsample(frame)
-        
-        # 4. Save the result
-        cv2.imwrite(output_path, result)
-        
-        # 5. Report success
-        status_q.put({"type": "progress", "file": file_name})
-        return 0
+        # Multiprocessing Queue for progress updates from worker processes
+        self.progress_queue = Queue()
 
-    except cv2.error as e:
-        status_q.put({"type": "error", "file": file_name, "message": f"OpenCV Error: {e}"})
-        return 1
-    except Exception as e:
-        status_q.put({"type": "error", "file": file_name, "message": f"Unexpected Error: {e}"})
-        return 1
-        
-# --- GUI and Main Thread Logic ---
+        self.create_widgets()
 
-def create_gui():
-    """Initializes the main application window."""
-    global root, status_var, progress_bar, start_button, stop_button
+    def create_widgets(self):
+        # Apply a modern style
+        style = ttk.Style()
+        style.theme_use('clam')
+        style.configure('TFrame', background='#34495e')
+        style.configure('TLabel', background='#2c3e50', foreground='white', font=('Inter', 10))
+        style.configure('TButton', font=('Inter', 10, 'bold'), padding=6, background='#1abc9c', foreground='white')
+        style.map('TButton', background=[('active', '#16a085')])
+        style.configure('TProgressbar', thickness=15, troughcolor='#34495e', background='#2ecc71')
 
-    root = tk.Tk()
-    root.title("Batch Image Clarity Enhancer (GPU/Multiprocessing)")
-    root.geometry("800x500")
-    root.configure(bg='#2e2e2e')
+        main_frame = ttk.Frame(self.master, padding="15", style='TFrame')
+        main_frame.pack(fill='both', expand=True)
 
-    style = ttk.Style()
-    style.theme_use('clam')
-    style.configure('TFrame', background='#2e2e2e')
-    style.configure('TButton', background='#4a4a4a', foreground='white', font=('Inter', 10, 'bold'), borderwidth=1)
-    style.map('TButton', background=[('active', '#5c5c5c')])
-    style.configure('TLabel', background='#2e2e2e', foreground='white', font=('Inter', 10))
-    style.configure('TProgressbar', background='#00c04b', troughcolor='#3c3c3c') # Green bar to signify speed
+        # Title
+        title_label = ttk.Label(main_frame, text="Super Resolution Batch Processor", font=('Inter', 18, 'bold'), anchor='center')
+        title_label.pack(pady=(5, 20))
 
-    main_frame = ttk.Frame(root, padding="20 20 20 20")
-    main_frame.pack(fill='both', expand=True)
+        # --- Directory Selection Frame ---
+        dir_frame = ttk.Frame(main_frame, style='TFrame')
+        dir_frame.pack(fill='x', pady=5)
 
-    # --- INPUT/OUTPUT PATHS ---
-    path_frame = ttk.Frame(main_frame)
-    path_frame.pack(fill='x', pady=10)
+        # Input Directory
+        self.create_path_selector(dir_frame, "Input Frames Directory:", self.input_dir, self.select_input_dir)
+        # Output Directory
+        self.create_path_selector(dir_frame, "Output Directory:", self.output_dir, self.select_output_dir)
+        # Model File
+        self.create_path_selector(dir_frame, "Model (.pb) File:", self.model_path, self.select_model_file)
 
-    ttk.Label(path_frame, text="1. Input Frames Folder:").grid(row=0, column=0, sticky='w', padx=5, pady=5)
-    global input_path_label
-    input_path_label = ttk.Label(path_frame, text="No folder selected", background='#3c3c3c', foreground='#a0a0a0', anchor='w', relief='groove')
-    input_path_label.grid(row=0, column=1, sticky='ew', padx=5, pady=5, ipadx=5, ipady=5)
-    ttk.Button(path_frame, text="Browse", command=select_input_folder).grid(row=0, column=2, padx=5, pady=5)
+        # --- Status and Progress ---
+        status_label = ttk.Label(main_frame, text="Status:", style='TLabel')
+        status_label.pack(fill='x', pady=(10, 0))
 
-    ttk.Label(path_frame, text="2. Output Enhanced Folder:").grid(row=1, column=0, sticky='w', padx=5, pady=5)
-    global output_path_label
-    output_path_label = ttk.Label(path_frame, text="No folder selected", background='#3c3c3c', foreground='#a0a0a0', anchor='w', relief='groove')
-    output_path_label.grid(row=1, column=1, sticky='ew', padx=5, pady=5, ipadx=5, ipady=5)
-    ttk.Button(path_frame, text="Browse", command=select_output_folder).grid(row=1, column=2, padx=5, pady=5)
-    
-    path_frame.grid_columnconfigure(1, weight=1)
+        status_display = ttk.Label(main_frame, textvariable=self.status_var, background='#34495e', foreground='#f1c40f', font=('Inter', 10, 'italic'), padding=5)
+        status_display.pack(fill='x', pady=5)
 
-    # --- MODEL SELECTION ---
-    model_frame = ttk.Frame(main_frame)
-    model_frame.pack(fill='x', pady=10)
+        self.progress_bar = ttk.Progressbar(main_frame, orient="horizontal", length=400, mode="determinate", style='TProgressbar')
+        self.progress_bar.pack(fill='x', pady=10)
 
-    ttk.Label(model_frame, text="3. Model File (.pb):").grid(row=0, column=0, sticky='w', padx=5, pady=5)
-    global model_path_label
-    model_path_label = ttk.Label(model_frame, text="No model selected", background='#3c3c3c', foreground='#a0a0a0', anchor='w', relief='groove')
-    model_path_label.grid(row=0, column=1, sticky='ew', padx=5, pady=5, ipadx=5, ipady=5)
-    ttk.Button(model_frame, text="Browse", command=select_model_file).grid(row=0, column=2, padx=5, pady=5)
+        # --- Control Buttons ---
+        button_frame = ttk.Frame(main_frame, style='TFrame')
+        button_frame.pack(fill='x', pady=20)
 
-    model_frame.grid_columnconfigure(1, weight=1)
+        self.start_button = ttk.Button(button_frame, text="Start Enhancement", command=self.start_enhancement, style='TButton')
+        self.start_button.pack(side='left', expand=True, padx=10)
 
-    # --- CONTROL BUTTONS ---
-    control_frame = ttk.Frame(main_frame)
-    control_frame.pack(fill='x', pady=20)
+        self.stop_button = ttk.Button(button_frame, text="Stop", command=self.stop_enhancement, state='disabled', style='TButton')
+        self.stop_button.pack(side='left', expand=True, padx=10)
 
-    start_button = ttk.Button(control_frame, text="Start Enhancement (GPU Accelerated)", command=start_processing, style='TButton')
-    start_button.pack(side='left', fill='x', expand=True, padx=5)
+        # --- Log Output ---
+        log_label = ttk.Label(main_frame, text="Processing Log:", style='TLabel')
+        log_label.pack(fill='x', pady=(10, 0))
 
-    stop_button = ttk.Button(control_frame, text="Stop Processing", command=stop_processing, state=tk.DISABLED, style='TButton')
-    stop_button.pack(side='left', fill='x', expand=True, padx=5)
+        self.log_text = scrolledtext.ScrolledText(main_frame, height=8, state='disabled', bg='#1f2b37', fg='#ecf0f1', font=('Inter', 9), relief=tk.FLAT)
+        self.log_text.pack(fill='both', expand=True)
 
-    # --- STATUS AND PROGRESS ---
-    global progress_bar
-    progress_bar = ttk.Progressbar(main_frame, orient='horizontal', length=760, mode='determinate')
-    progress_bar.pack(fill='x', pady=10)
-
-    global status_var
-    status_var = tk.StringVar(value="Ready. Requires CUDA/cuDNN environment setup.")
-    ttk.Label(main_frame, textvariable=status_var, font=('Inter', 10, 'italic'), foreground='#00c04b').pack(fill='x', pady=5)
-    
-    root.protocol("WM_DELETE_WINDOW", on_closing)
-
-    root.mainloop()
-
-def select_input_folder():
-    """Opens a dialog to select the folder containing low-res frames."""
-    global input_folder
-    folder = filedialog.askdirectory(title="Select Input Frames Folder")
-    if folder:
-        input_folder = folder
-        input_path_label.config(text=input_folder, foreground='white')
-
-def select_output_folder():
-    """Opens a dialog to select the folder for enhanced frames."""
-    global output_folder
-    folder = filedialog.askdirectory(title="Select Output Enhanced Folder")
-    if folder:
-        output_folder = folder
-        output_path_label.config(text=output_folder, foreground='white')
-        
-def select_model_file():
-    """Opens a dialog to select the Super Resolution model file (.pb)."""
-    global model_path
-    file = filedialog.askopenfilename(
-        title="Select Super Resolution Model File (.pb)",
-        filetypes=(("OpenCV Model Files", "*.pb"), ("All files", "*.*"))
-    )
-    if file:
-        model_path = file
-        model_path_label.config(text=os.path.basename(model_path), foreground='white')
-
-def start_processing():
-    """Checks prerequisites, initializes the pool, and starts the processing thread."""
-    global input_folder, output_folder, model_path, is_processing, total_files, processed_count, manager, status_queue, pool
-
-    if not input_folder or not output_folder or not model_path:
-        messagebox.showerror("Missing Information", "Please select input folder, output folder, and the model file (.pb).")
-        return
-
-    input_files = [f for f in os.listdir(input_folder) if f.lower().endswith(('.png', '.jpg', '.jpeg', '.bmp'))]
-    total_files = len(input_files)
-    processed_count = 0
-
-    if total_files == 0:
-        messagebox.showinfo("No Files", "Input folder is empty or contains no supported image files.")
-        return
-
-    # Initialize multiprocessing components
-    manager = multiprocessing.Manager()
-    status_queue = manager.Queue()
-    
-    # Use all available cores minus 1 for the GUI responsiveness
-    num_cores = max(1, multiprocessing.cpu_count() - 1)
-    pool = multiprocessing.Pool(processes=num_cores)
-    
-    # Prepare the partial function for the pool to receive fixed args
-    process_func = partial(
-        process_frame_worker, 
-        input_dir=input_folder, 
-        output_dir=output_folder, 
-        model_path_str=model_path, 
-        status_q=status_queue
-    )
-    
-    # Disable start, enable stop button
-    start_button.config(state=tk.DISABLED)
-    stop_button.config(state=tk.NORMAL)
-    is_processing = True
-    progress_bar['value'] = 0
-    status_var.set(f"Starting GPU-accelerated pool on {num_cores} workers. Total files: {total_files}")
-    
-    # Start all tasks asynchronously
-    global async_result
-    # The pool handles the scheduling of image files to workers (processes)
-    async_result = pool.map_async(process_func, input_files)
-
-    # Start polling the queue for updates
-    root.after(100, update_progress)
-
-def update_progress():
-    """Polls the status queue and updates the GUI progress bar and status label."""
-    global is_processing, processed_count, total_files, async_result
-
-    if not is_processing:
-        return
-
-    while not status_queue.empty():
-        item = status_queue.get()
-        if item["type"] == "progress":
-            processed_count += 1
-            progress = (processed_count / total_files) * 100
-            progress_bar['value'] = progress
-            status_var.set(f"Processing ({processed_count}/{total_files}): {item['file']}")
-        elif item["type"] == "error":
-            # An error occurred in a worker, log it but don't stop the whole process
-            print(f"Error processing {item['file']}: {item['message']}")
-            # We still need to count this as 'processed' to update the progress bar correctly
-            processed_count += 1 
-            progress = (processed_count / total_files) * 100
-            progress_bar['value'] = progress
-            status_var.set(f"Error on {item['file']}. Continuing...")
-    
-    # Check if all processes are finished
-    if async_result.ready():
-        # Clean up and finalize
-        finalize_processing(True)
-        return
-
-    # Re-schedule the progress check
-    root.after(100, update_progress)
+        # Show CPU/Core Info
+        core_info = ttk.Label(main_frame, text=f"Configured to use {CPU_CORES} CPU/Multiprocessing Cores.", background='#2c3e50', foreground='#95a5a6', font=('Inter', 8))
+        core_info.pack(pady=5)
 
 
-def stop_processing():
-    """Sets the flag to stop the processing worker gracefully and terminates the pool."""
-    global is_processing, pool
-    
-    if pool:
-        pool.terminate()
-        pool.join() # Wait for the worker processes to exit
-        
-    finalize_processing(False)
-        
-def finalize_processing(is_completed):
-    """Resets the UI state after the batch finishes or is stopped."""
-    global is_processing, pool, processed_count, total_files
-    
-    is_processing = False
-    
-    start_button.config(state=tk.NORMAL)
-    stop_button.config(state=tk.DISABLED)
-    
-    if is_completed:
-        final_message = f"Batch enhancement completed! {processed_count} files saved to: {output_folder}"
-        status_var.set(final_message)
-        messagebox.showinfo("Process Complete", final_message)
-    else:
-        final_message = f"Processing stopped by user. {processed_count} files enhanced so far."
-        status_var.set(final_message)
-        messagebox.showwarning("Process Stopped", final_message)
+    def create_path_selector(self, parent, label_text, var, command):
+        frame = ttk.Frame(parent, style='TFrame')
+        frame.pack(fill='x', pady=5)
 
-    if pool:
-        pool.close()
-        pool.join()
-        pool = None
+        label = ttk.Label(frame, text=label_text, width=25)
+        label.pack(side='left', padx=(0, 10))
 
-def on_closing():
-    """Handles window closing by stopping the processes."""
-    global is_processing
-    if is_processing:
-        stop_processing()
-    root.destroy()
+        entry = ttk.Entry(frame, textvariable=var, state='readonly', width=60)
+        entry.pack(side='left', fill='x', expand=True)
+
+        button = ttk.Button(frame, text="Browse", command=command)
+        button.pack(side='right', padx=5)
+
+    def log(self, message):
+        self.master.after(0, self._append_log, message)
+
+    def _append_log(self, message):
+        self.log_text.config(state='normal')
+        self.log_text.insert(tk.END, f"{time.strftime('%H:%M:%S')} - {message}\n")
+        self.log_text.yview(tk.END)
+        self.log_text.config(state='disabled')
+
+    # --- Directory and File Selectors ---
+    def select_input_dir(self):
+        directory = filedialog.askdirectory(title="Select Directory with Input Frames")
+        if directory:
+            self.input_dir.set(directory)
+
+    def select_output_dir(self):
+        directory = filedialog.askdirectory(title="Select Output Directory for Enhanced Frames")
+        if directory:
+            self.output_dir.set(directory)
+
+    def select_model_file(self):
+        file = filedialog.askopenfilename(title="Select Super Resolution Model (.pb)", filetypes=[("Protocol Buffer Models", "*.pb")])
+        if file:
+            self.model_path.set(file)
+
+    # --- Enhancement Logic ---
+
+    def start_enhancement(self):
+        if self.is_running:
+            self.status_var.set("Already running...")
+            return
+
+        input_path = self.input_dir.get()
+        output_path = self.output_dir.get()
+        model_file = self.model_path.get()
+
+        if not all([input_path, output_path, model_file]):
+            self.status_var.set("Error: All paths (Input, Output, Model) must be selected.")
+            return
+
+        if not os.path.exists(model_file):
+            self.status_var.set(f"Error: Model file not found at {model_file}")
+            return
+
+        # 1. Prepare Job List
+        image_files = sorted([f for f in os.listdir(input_path) if f.lower().endswith(('.png', '.jpg', '.jpeg'))])
+        if not image_files:
+            self.status_var.set("Error: No images found in the input directory.")
+            return
+
+        self.job_queue = [(os.path.join(input_path, f), os.path.join(output_path, f), model_file) for f in image_files]
+        self.total_frames = len(self.job_queue)
+        self.processed_count = 0
+        self.stop_event.clear()
+        self.is_running = True
+        self.log_text.config(state='normal')
+        self.log_text.delete('1.0', tk.END)
+        self.log_text.config(state='disabled')
+
+        self.status_var.set(f"Starting enhancement on {self.total_frames} frames using {CPU_CORES} cores...")
+        self.start_button.config(state='disabled')
+        self.stop_button.config(state='normal')
+        self.progress_bar['value'] = 0
+        self.progress_bar['maximum'] = self.total_frames
+
+        # 2. Start Multiprocessing Pool in a separate thread
+        threading.Thread(target=self._run_multiprocessing_pool, daemon=True).start()
+
+        # 3. Start UI progress monitoring
+        self.master.after(100, self.update_progress)
+
+
+    def _run_multiprocessing_pool(self):
+        # We use 'with Pool' for safe process management
+        try:
+            with Pool(processes=CPU_CORES) as pool:
+                # Map the process_frame_worker function to the job_queue
+                # We pass the progress_queue as a constant argument for communication
+                pool.starmap(self._process_frame_worker, [(task + (self.progress_queue, self.stop_event)) for task in self.job_queue])
+        except Exception as e:
+            self.log(f"Multiprocessing Error: {e}")
+        finally:
+            self.is_running = False
+            self.master.after(0, self._finish_enhancement)
+
+    @staticmethod
+    def _process_frame_worker(input_path, output_path, model_file, progress_queue, stop_event):
+        if stop_event.is_set():
+            return
+
+        try:
+            # 1. Load the Super Resolution model
+            sr = cv2.dnn_superres.DnnSuperResImpl_create()
+            sr.readModel(model_file)
+
+            # Extract scale from filename (e.g., LapSRN_x8.pb -> 8)
+            scale = int(model_file.split('_x')[-1].split('.')[0])
+            sr.setModel("lapsrn", scale)
+
+            # 2. Configure Backend for Maximum Speed (CUDA/GPU)
+            # This is the essential step for performance.
+            sr.setPreferableBackend(cv2.dnn.DNN_BACKEND_CUDA)
+            sr.setPreferableTarget(cv2.dnn.DNN_TARGET_CUDA)
+
+            # --- Fallback Option (If CUDA setup fails, use this instead) ---
+            # sr.setPreferableBackend(cv2.dnn.DNN_BACKEND_OPENCV)
+            # sr.setPreferableTarget(cv2.dnn.DNN_TARGET_CPU)
+
+            # 3. Read the image
+            img = cv2.imread(input_path)
+            if img is None:
+                progress_queue.put(f"FAIL: Could not read image {os.path.basename(input_path)}")
+                return
+
+            # 4. Perform Upscaling
+            enhanced_img = sr.upsample(img)
+
+            # 5. Write the enhanced image
+            cv2.imwrite(output_path, enhanced_img)
+
+            # 6. Report Success
+            progress_queue.put(f"SUCCESS: {os.path.basename(input_path)}")
+
+        except Exception as e:
+            # Report failure
+            progress_queue.put(f"FAIL: {os.path.basename(input_path)} - {e}")
+
+    def update_progress(self):
+        # Safely pull messages from the Multiprocessing Queue
+        while True:
+            try:
+                # Use standard queue to safely get from the multiprocessing queue
+                message = self.progress_queue.get_nowait()
+                self.processed_count += 1
+
+                if message.startswith("SUCCESS"):
+                    self.log(message)
+                else:
+                    # Log errors (e.g., failed read, CUDA failure, etc.)
+                    self.log(f"ERROR: {message}")
+
+                # Update UI elements
+                progress = (self.processed_count / self.total_frames) * 100
+                self.progress_bar['value'] = self.processed_count
+                self.status_var.set(f"Processing... {self.processed_count} of {self.total_frames} frames ({progress:.1f}%)")
+
+            except q_temp.Empty:
+                # No more items in the queue for now
+                break
+
+        if self.is_running:
+            # Schedule the next check
+            self.master.after(100, self.update_progress)
+
+    def stop_enhancement(self):
+        self.stop_event.set()
+        self.is_running = False
+        self.status_var.set("Stopping workers. Please wait...")
+        self._finish_enhancement()
+
+    def _finish_enhancement(self):
+        # Called when the pool finishes or stop is clicked
+        self.start_button.config(state='normal')
+        self.stop_button.config(state='disabled')
+        if not self.stop_event.is_set():
+            self.status_var.set(f"Finished! {self.processed_count} frames processed.")
+        else:
+            self.status_var.set("Stopped by user.")
 
 
 if __name__ == '__main__':
-    # Add this line for Windows compatibility when using multiprocessing
-    multiprocessing.freeze_support()
-    create_gui()
+    # Initialize necessary Firebase variables for Canvas execution environment (not used by this local script but good practice)
+    # The cv2 import must be done before the app loop starts
+    try:
+        root = tk.Tk()
+        app = BatchImageClarityEnhancer(root)
+        root.mainloop()
+    except Exception as e:
+        print(f"An unexpected error occurred during execution: {e}")
 
